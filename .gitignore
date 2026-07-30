@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets  ← never commit this
+.env
+
+# Data (signals log – can be large)
+data/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Cloudflare credentials (contain tunnel secrets)
+cloudflared/*.json
+
+# Local History
+.lh/
