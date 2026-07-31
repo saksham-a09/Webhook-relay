@@ -31,3 +31,5 @@ cloudflared/*.json
 
 # Local History
 .lh/
+/tests
+/mql5

@@ -2,20 +2,29 @@ import csv
 import json
 import os
 import threading
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Optional
 from dotenv import load_dotenv
 
 import requests
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Query, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+import mt5_trader
+import trade_queue
 
 load_dotenv()
 
-app = FastAPI(title="TradingView Signal Relay", version="1.0.0")
+app = FastAPI(title="TradingView Signal Relay & MT5 EA Server", version="2.0.0")
+
+@app.on_event("startup")
+def startup_event():
+    if mt5_trader.is_mt5_enabled():
+        mt5_trader.init_mt5()
+
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 CSV_PATH = Path(os.getenv("CSV_PATH", DATA_DIR / "signals.csv"))
@@ -24,8 +33,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API_BASE = "https://api.telegram.org/bot"
 GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "")
-
-import uuid
+LONG_POLL_TIMEOUT = float(os.getenv("LONG_POLL_TIMEOUT", "20.0"))
 
 CSV_COLUMNS = [
     "trade_id",
@@ -53,17 +61,40 @@ csv_lock = threading.Lock()
 
 
 class SignalEnvelope(BaseModel):
-    token: str | None = Field(default=None, description="Shared secret for webhook authentication")
-    signal_type: str | None = None
-    symbol: str | None = None
-    exchange: str | None = None
-    timeframe: str | None = None
-    price: float | None = None
-    side: str | None = None
-    strategy: str | None = None
-    quantity: float | None = None
-    message: str | None = None
-    source: str | None = Field(default="pinescript")
+    token: Optional[str] = Field(default=None, description="Shared secret for webhook authentication")
+    signal_type: Optional[str] = None
+    symbol: Optional[str] = None
+    exchange: Optional[str] = None
+    timeframe: Optional[str] = None
+    price: Optional[float] = None
+    side: Optional[str] = None
+    strategy: Optional[str] = None
+    quantity: Optional[float] = None
+    message: Optional[str] = None
+    source: Optional[str] = Field(default="pinescript")
+    target_client: Optional[str] = Field(default="all", description="Target EA client_id or 'all'")
+
+
+class TradeAckPayload(BaseModel):
+    trade_id: str
+    client_id: str
+    status: str = "success"
+    ticket: Optional[int] = None
+    deal: Optional[int] = None
+    symbol: Optional[str] = None
+    volume: Optional[float] = None
+    price: Optional[float] = None
+    closed_tickets: Optional[List[int]] = None
+    error: Optional[str] = None
+
+
+class HeartbeatPayload(BaseModel):
+    client_id: str
+    account_login: Optional[str] = None
+    broker: Optional[str] = None
+    server: Optional[str] = None
+    magic_number: Optional[int] = None
+    ping_ms: Optional[float] = 0.0
 
 
 def utc_now() -> str:
@@ -91,42 +122,50 @@ def normalize_payload(payload: Any) -> dict[str, Any]:
     return {"message": str(payload)}
 
 
-def authenticate(payload: dict[str, Any]) -> None:
+def authenticate(payload: dict[str, Any], token_header: Optional[str] = None) -> None:
     if not WEBHOOK_TOKEN:
         return
-    token = str(payload.get("token") or "")
-    # if token != WEBHOOK_TOKEN:
-    #     raise HTTPException(status_code=401, detail="Invalid webhook token")
+    token = str(payload.get("token") or token_header or "")
+    # Note: Authentication is relaxed if token empty unless enforced in env
+    if os.getenv("ENFORCE_TOKEN", "false").lower() in ("true", "1") and token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid authorization token")
 
 
-def telegram_message(payload: dict[str, Any]) -> str:
-    msg_type = payload.get("type", "").upper()
-    side = payload.get("side", "").upper()
-    action = payload.get("action", "").lower()
+def telegram_message(payload: dict[str, Any], mt5_result: dict[str, Any] | None = None) -> str:
+    msg_type = (payload.get("type") or payload.get("signal_type") or "").upper()
+    side = (payload.get("side") or "").upper()
+    action = (payload.get("action") or "").lower()
     comment = payload.get("comment", "")
     ticker = payload.get("ticker", payload.get("symbol", ""))
-    
+
     is_trigger = msg_type == "TRIGGER"
     is_entry = side == "LONG" or action == "buy"
     is_exit = side == "EXIT" or action in ["sell", "close"] or "Sl" in comment or "Tp" in comment
 
     if is_trigger:
-        return f"🚨 TRIGGER ALERT 🚨\nTicker: {ticker}\nTimeframe: {payload.get('timeframe', '')}\nTrigger Close: {payload.get('trigger_close', '')}"
+        msg = f"[TRIGGER ALERT]\nTicker: {ticker}\nTimeframe: {payload.get('timeframe', '')}\nTrigger Close: {payload.get('trigger_close', '')}"
     elif is_entry:
-        return f"🟢 LONG ENTRY 🟢\nTicker: {ticker}\nEntry Price: {payload.get('entry_price', payload.get('price', ''))}\nSL: {payload.get('sl', '')}\nTP Main: {payload.get('tp_main', '')}"
+        msg = f"[LONG ENTRY]\nTicker: {ticker}\nEntry Price: {payload.get('entry_price', payload.get('price', ''))}\nSL: {payload.get('sl', '')}\nTP Main: {payload.get('tp_main', '')}"
     elif is_exit:
         reason = comment or payload.get('reason', 'Exit signal')
         price = payload.get('price', payload.get('exit_price', ''))
-        return f"🔴 EXIT 🔴\nTicker: {ticker}\nExit Price: {price}\nReason: {reason}"
+        msg = f"[EXIT]\nTicker: {ticker}\nExit Price: {price}\nReason: {reason}"
     else:
         parts = ["TradingView signal received"]
         for k, v in payload.items():
             if k not in ["token", "payload_json"]:
                 parts.append(f"{k}: {v}")
-        return "\n".join(parts)
+        msg = "\n".join(parts)
+
+    if mt5_result:
+        mt5_summary = mt5_trader.format_telegram_mt5_summary(mt5_result)
+        if mt5_summary:
+            msg += mt5_summary
+
+    return msg
 
 
-def send_telegram_alert(payload: dict[str, Any]) -> tuple[bool, str]:
+def send_telegram_alert(payload: dict[str, Any], mt5_result: dict[str, Any] | None = None) -> tuple[bool, str]:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False, "Telegram not configured"
 
@@ -136,7 +175,7 @@ def send_telegram_alert(payload: dict[str, Any]) -> tuple[bool, str]:
             url,
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": telegram_message(payload),
+                "text": telegram_message(payload, mt5_result),
                 "disable_web_page_preview": True,
             },
             timeout=10,
@@ -164,24 +203,24 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
     msg_type = (payload.get("type") or payload.get("signal_type") or "").strip()
     csv_path = get_csv_path(msg_type)
     ensure_csv_file(csv_path)
-    
+
     msg_type_upper = msg_type.upper()
     side = payload.get("side", "").upper()
     action = payload.get("action", "").lower()
     comment = payload.get("comment", "")
     ticker = payload.get("ticker", payload.get("symbol", ""))
-    
+
     is_trigger = msg_type_upper == "TRIGGER"
     is_entry = side == "LONG" or action == "buy"
     is_exit = side == "EXIT" or action in ["sell", "close"] or "Sl" in comment or "Tp" in comment
-    
+
     with csv_lock:
         rows = []
         with csv_path.open("r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames:
                 rows = list(reader)
-        
+
         if is_exit:
             updated = False
             for row in reversed(rows):
@@ -192,7 +231,7 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
                     row["exit_time"] = utc_now()
                     updated = True
                     break
-            
+
             if not updated:
                 new_row = {col: "" for col in CSV_COLUMNS}
                 new_row.update({
@@ -230,16 +269,90 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
                 "telegram_error": telegram_error
             })
             rows.append(new_row)
-            
+
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
             writer.writeheader()
             writer.writerows(rows)
 
 
+# --------------------------------------------------------------------------
+# Multi-EA Client API Endpoints (Low-Latency Long-Polling & ACKs)
+# --------------------------------------------------------------------------
+
+@app.get("/api/v1/trades/pending")
+async def get_pending_trades(
+    client_id: str = Query(..., description="Unique MT5 EA client identifier"),
+    timeout: float = Query(default=LONG_POLL_TIMEOUT, description="Long-poll timeout in seconds"),
+    x_token: Optional[str] = Header(None, alias="X-Token")
+) -> dict:
+    if WEBHOOK_TOKEN and x_token and x_token != WEBHOOK_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    trades = await trade_queue.global_queue.get_pending_trades(client_id, timeout=timeout)
+    return {
+        "status": "ok",
+        "client_id": client_id,
+        "count": len(trades),
+        "trades": trades
+    }
+
+
+@app.post("/api/v1/trades/ack")
+async def acknowledge_trade(
+    ack: TradeAckPayload,
+    background_tasks: BackgroundTasks
+) -> dict:
+    trade = await trade_queue.global_queue.acknowledge_trade(ack.trade_id, ack.client_id, ack.model_dump())
+    if not trade:
+        return {"status": "ignored", "message": "Trade ID not found or expired"}
+
+    # Format Telegram update with execution result
+    mt5_result = {
+        "status": ack.status,
+        "client_acks": trade.acknowledged_clients,
+    }
+    
+    telegram_sent, telegram_status = send_telegram_alert(trade.payload, mt5_result)
+    background_tasks.add_task(send_to_google_sheet, trade.payload, telegram_sent, "" if telegram_sent else telegram_status)
+
+    return {
+        "status": "ok",
+        "trade_id": ack.trade_id,
+        "total_acks": len(trade.acknowledged_clients),
+    }
+
+
+@app.post("/api/v1/clients/heartbeat")
+def client_heartbeat(hb: HeartbeatPayload) -> dict:
+    trade_queue.global_queue.register_client(
+        client_id=hb.client_id,
+        account_login=hb.account_login,
+        broker=hb.broker,
+        server=hb.server,
+        magic_number=hb.magic_number,
+        ping_ms=hb.ping_ms or 0.0,
+    )
+    return {"status": "ok", "client_id": hb.client_id}
+
+
+@app.get("/api/v1/clients")
+def list_clients() -> dict:
+    clients = trade_queue.global_queue.get_active_clients()
+    return {"status": "ok", "count": len(clients), "clients": clients}
+
+
+# --------------------------------------------------------------------------
+# Webhook Endpoints
+# --------------------------------------------------------------------------
+
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health() -> dict[str, Any]:
+    active_clients = len(trade_queue.global_queue.get_active_clients())
+    return {
+        "status": "ok",
+        "active_ea_clients": active_clients,
+    }
 
 
 @app.post("/webhook")
@@ -270,7 +383,8 @@ async def webhook_pinescript(request: Request, background_tasks: BackgroundTasks
     if not normalized.get("message"):
         normalized["message"] = normalized.get("signal_type") or "TradingView signal"
 
-    telegram_sent, telegram_status = send_telegram_alert(normalized)
+    mt5_result = mt5_trader.execute_trade(normalized)
+    telegram_sent, telegram_status = send_telegram_alert(normalized, mt5_result)
     append_signal_row(normalized, telegram_sent=telegram_sent, telegram_error="" if telegram_sent else telegram_status)
     background_tasks.add_task(send_to_google_sheet, normalized, telegram_sent, "" if telegram_sent else telegram_status)
 
@@ -279,8 +393,10 @@ async def webhook_pinescript(request: Request, background_tasks: BackgroundTasks
         content={
             "status": "ok",
             "received_at": utc_now(),
+            "trade_id": normalized["trade_id"],
             "telegram_sent": telegram_sent,
             "telegram_status": telegram_status,
+            "mt5_result": mt5_result,
         },
     )
 
@@ -289,21 +405,24 @@ async def webhook_pinescript(request: Request, background_tasks: BackgroundTasks
 async def webhook_signal(signal: SignalEnvelope, background_tasks: BackgroundTasks) -> JSONResponse:
     payload = signal.model_dump()
     authenticate(payload)
-    
+
     if "trade_id" not in payload:
         payload["trade_id"] = str(uuid.uuid4())
-        
-    telegram_sent, telegram_status = send_telegram_alert(payload)
+
+    mt5_result = mt5_trader.execute_trade(payload)
+    telegram_sent, telegram_status = send_telegram_alert(payload, mt5_result)
     append_signal_row(payload, telegram_sent=telegram_sent, telegram_error="" if telegram_sent else telegram_status)
     background_tasks.add_task(send_to_google_sheet, payload, telegram_sent, "" if telegram_sent else telegram_status)
-    
+
     return JSONResponse(
         status_code=200,
         content={
             "status": "ok",
             "received_at": utc_now(),
+            "trade_id": payload["trade_id"],
             "telegram_sent": telegram_sent,
             "telegram_status": telegram_status,
+            "mt5_result": mt5_result,
         },
     )
 
