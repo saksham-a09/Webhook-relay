@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 import requests
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Query, Header
 from fastapi.responses import JSONResponse
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 import mt5_trader
@@ -34,6 +36,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 TELEGRAM_API_BASE = "https://api.telegram.org/bot"
 GOOGLE_SHEET_URL = os.getenv("GOOGLE_SHEET_URL", "")
 LONG_POLL_TIMEOUT = float(os.getenv("LONG_POLL_TIMEOUT", "20.0"))
+SIGNAL_DEBOUNCE_SECONDS = float(os.getenv("SIGNAL_DEBOUNCE_SECONDS", "30.0"))
 
 CSV_COLUMNS = [
     "trade_id",
@@ -58,6 +61,7 @@ CSV_COLUMNS = [
 ]
 
 csv_lock = threading.Lock()
+recent_signals_cache = {}
 
 
 class SignalEnvelope(BaseModel):
@@ -99,6 +103,38 @@ class HeartbeatPayload(BaseModel):
 
 def utc_now() -> str:
     return datetime.now(timezone(timedelta(hours=-4))).isoformat()
+
+
+def is_duplicate_signal(payload: dict[str, Any]) -> bool:
+    if SIGNAL_DEBOUNCE_SECONDS <= 0:
+        return False
+        
+    ticker = str(payload.get("ticker", payload.get("symbol", ""))).strip().upper()
+    side = str(payload.get("side", payload.get("action", ""))).strip().upper()
+    signal_type = str(payload.get("type", payload.get("signal_type", ""))).strip().upper()
+    price = str(payload.get("entry_price", payload.get("price", ""))).strip()
+    sl = str(payload.get("sl", payload.get("stop_loss", ""))).strip()
+    tp = str(payload.get("tp_main", payload.get("tp", payload.get("take_profit", "")))).strip()
+    
+    # Create a unique key for the signal
+    sig_key = f"{ticker}_{side}_{signal_type}_{price}_{sl}_{tp}"
+    if not sig_key.replace("_", ""):
+        return False
+        
+    now = time.time()
+    last_seen = recent_signals_cache.get(sig_key, 0)
+    
+    if now - last_seen < SIGNAL_DEBOUNCE_SECONDS:
+        return True
+        
+    recent_signals_cache[sig_key] = now
+    
+    # Cleanup old cache entries
+    to_delete = [k for k, v in recent_signals_cache.items() if now - v > 3600]
+    for k in to_delete:
+        del recent_signals_cache[k]
+        
+    return False
 
 
 def get_csv_path(msg_type: str) -> Path:
@@ -313,7 +349,7 @@ async def acknowledge_trade(
         "client_acks": trade.acknowledged_clients,
     }
     
-    telegram_sent, telegram_status = send_telegram_alert(trade.payload, mt5_result)
+    telegram_sent, telegram_status = await run_in_threadpool(send_telegram_alert, trade.payload, mt5_result)
     background_tasks.add_task(send_to_google_sheet, trade.payload, telegram_sent, "" if telegram_sent else telegram_status)
 
     return {
@@ -383,9 +419,20 @@ async def webhook_pinescript(request: Request, background_tasks: BackgroundTasks
     if not normalized.get("message"):
         normalized["message"] = normalized.get("signal_type") or "TradingView signal"
 
+    # Deduplication check
+    if is_duplicate_signal(normalized):
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ignored",
+                "reason": f"Duplicate signal ignored within {SIGNAL_DEBOUNCE_SECONDS}s window",
+                "received_at": utc_now(),
+            }
+        )
+
     mt5_result = mt5_trader.execute_trade(normalized)
-    telegram_sent, telegram_status = send_telegram_alert(normalized, mt5_result)
-    append_signal_row(normalized, telegram_sent=telegram_sent, telegram_error="" if telegram_sent else telegram_status)
+    telegram_sent, telegram_status = await run_in_threadpool(send_telegram_alert, normalized, mt5_result)
+    await run_in_threadpool(append_signal_row, normalized, telegram_sent, "" if telegram_sent else telegram_status)
     background_tasks.add_task(send_to_google_sheet, normalized, telegram_sent, "" if telegram_sent else telegram_status)
 
     return JSONResponse(
@@ -409,9 +456,20 @@ async def webhook_signal(signal: SignalEnvelope, background_tasks: BackgroundTas
     if "trade_id" not in payload:
         payload["trade_id"] = str(uuid.uuid4())
 
+    # Deduplication check
+    if is_duplicate_signal(payload):
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ignored",
+                "reason": f"Duplicate signal ignored within {SIGNAL_DEBOUNCE_SECONDS}s window",
+                "received_at": utc_now(),
+            }
+        )
+
     mt5_result = mt5_trader.execute_trade(payload)
-    telegram_sent, telegram_status = send_telegram_alert(payload, mt5_result)
-    append_signal_row(payload, telegram_sent=telegram_sent, telegram_error="" if telegram_sent else telegram_status)
+    telegram_sent, telegram_status = await run_in_threadpool(send_telegram_alert, payload, mt5_result)
+    await run_in_threadpool(append_signal_row, payload, telegram_sent, "" if telegram_sent else telegram_status)
     background_tasks.add_task(send_to_google_sheet, payload, telegram_sent, "" if telegram_sent else telegram_status)
 
     return JSONResponse(
