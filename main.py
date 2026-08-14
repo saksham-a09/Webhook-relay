@@ -176,7 +176,7 @@ def telegram_message(payload: dict[str, Any], mt5_result: dict[str, Any] | None 
 
     is_trigger = msg_type == "TRIGGER"
     is_entry = side == "LONG" or action == "buy"
-    is_exit = side == "EXIT" or action in ["sell", "close"] or "Sl" in comment or "Tp" in comment
+    is_exit = side == "EXIT" or action in ["sell", "close", "close_all", "close all", "close_all_positions", "cancel_all"] or "Sl" in comment or "Tp" in comment
 
     if is_trigger:
         msg = f"[TRIGGER ALERT]\nTicker: {ticker}\nTimeframe: {payload.get('timeframe', '')}\nTrigger Close: {payload.get('trigger_close', '')}"
@@ -248,7 +248,7 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
 
     is_trigger = msg_type_upper == "TRIGGER"
     is_entry = side == "LONG" or action == "buy"
-    is_exit = side == "EXIT" or action in ["sell", "close"] or "Sl" in comment or "Tp" in comment
+    is_exit = side == "EXIT" or action in ["sell", "close", "close_all", "close all", "close_all_positions", "cancel_all"] or "Sl" in comment or "Tp" in comment
 
     with csv_lock:
         rows = []
