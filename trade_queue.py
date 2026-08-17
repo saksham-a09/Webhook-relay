@@ -132,8 +132,10 @@ class TradeQueueManager:
             if not trade or trade.is_expired:
                 continue
             # Check target filtering
-            if trade.target_client != "all" and trade.target_client != client_id:
-                continue
+            if trade.target_client != "all":
+                target_list = [t.strip() for t in trade.target_client.split(",")]
+                if client_id not in target_list:
+                    continue
             # Check if this client already saw or acknowledged this trade
             if client_id in trade.seen_by_clients or client_id in trade.acknowledged_clients:
                 continue
