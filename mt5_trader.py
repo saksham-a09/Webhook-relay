@@ -54,7 +54,14 @@ def execute_trade(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not is_mt5_enabled():
         return {"status": "disabled", "message": "MT5 is disabled in settings"}
 
-    target_client = str(payload.get("target_client") or payload.get("account_id") or "all")
+    target_raw = payload.get("target_client") if payload.get("target_client") is not None else payload.get("account_id")
+    if target_raw is None or target_raw == "":
+        target_client = "all"
+    elif isinstance(target_raw, (list, tuple, set)):
+        target_client = ",".join(str(x).strip() for x in target_raw if str(x).strip())
+    else:
+        target_client = str(target_raw).strip()
+
     default_vol = float(os.getenv("MT5_DEFAULT_VOLUME", "0.01"))
     if "quantity" not in payload and "volume" not in payload:
         payload["quantity"] = default_vol

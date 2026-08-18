@@ -124,6 +124,39 @@ class TradeQueueManager:
         logger.info(f"Enqueued trade {trade_id} (Target: {target_client}, Side: {payload.get('side')}, Ticker: {payload.get('ticker') or payload.get('symbol')})")
         return trade_id
 
+    def _is_client_targeted(self, target_client: Any, client_id: str) -> bool:
+        if not target_client:
+            return True
+
+        if isinstance(target_client, (list, tuple, set)):
+            target_list = [str(x).strip().lower() for x in target_client if str(x).strip()]
+        else:
+            target_str = str(target_client).strip().lower()
+            if target_str in ("all", "*", ""):
+                return True
+            target_list = [t.strip().lower() for t in target_str.split(",") if t.strip()]
+
+        if not target_list or "all" in target_list or "*" in target_list:
+            return True
+
+        client_info = self._clients.get(client_id)
+
+        # Build set of candidate identifiers for this client
+        cid = client_id.strip().lower()
+        candidates = {cid}
+
+        if cid.startswith("mt5_"):
+            candidates.add(cid[4:].strip())
+        else:
+            candidates.add(f"mt5_{cid}")
+
+        if client_info and client_info.account_login:
+            acc = str(client_info.account_login).strip().lower()
+            candidates.add(acc)
+            candidates.add(f"mt5_{acc}")
+
+        return bool(candidates.intersection(target_list))
+
     def _get_unseen_trades_for_client(self, client_id: str) -> List[Dict[str, Any]]:
         result = []
         now = time.time()
@@ -131,11 +164,9 @@ class TradeQueueManager:
             trade = self._trades.get(trade_id)
             if not trade or trade.is_expired:
                 continue
-            # Check target filtering
-            if trade.target_client != "all":
-                target_list = [t.strip() for t in trade.target_client.split(",")]
-                if client_id not in target_list:
-                    continue
+            # Check target filtering (supports MT5_ prefix, account login number, CSV, or list)
+            if not self._is_client_targeted(trade.target_client, client_id):
+                continue
             # Check if this client already saw or acknowledged this trade
             if client_id in trade.seen_by_clients or client_id in trade.acknowledged_clients:
                 continue

@@ -76,7 +76,7 @@ class SignalEnvelope(BaseModel):
     quantity: Optional[float] = None
     message: Optional[str] = None
     source: Optional[str] = Field(default="pinescript")
-    target_client: Optional[str] = Field(default="all", description="Target EA client_id or 'all'")
+    target_client: Optional[Any] = Field(default="all", description="Target EA client_id, account login, list/CSV, or 'all'")
 
 
 class TradeAckPayload(BaseModel):
@@ -115,9 +115,10 @@ def is_duplicate_signal(payload: dict[str, Any]) -> bool:
     price = str(payload.get("entry_price", payload.get("price", ""))).strip()
     sl = str(payload.get("sl", payload.get("stop_loss", ""))).strip()
     tp = str(payload.get("tp_main", payload.get("tp", payload.get("take_profit", "")))).strip()
+    target = str(payload.get("target_client") if payload.get("target_client") is not None else payload.get("account_id", "")).strip().lower()
     
     # Create a unique key for the signal
-    sig_key = f"{ticker}_{side}_{signal_type}_{price}_{sl}_{tp}"
+    sig_key = f"{ticker}_{side}_{signal_type}_{price}_{sl}_{tp}_{target}"
     if not sig_key.replace("_", ""):
         return False
         
