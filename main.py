@@ -112,13 +112,14 @@ def is_duplicate_signal(payload: dict[str, Any]) -> bool:
     ticker = str(payload.get("ticker", payload.get("symbol", ""))).strip().upper()
     side = str(payload.get("side", payload.get("action", ""))).strip().upper()
     signal_type = str(payload.get("type", payload.get("signal_type", ""))).strip().upper()
+    strategy = str(payload.get("strategy", payload.get("strategy_name", payload.get("magic_number", payload.get("magic", ""))))).strip().lower()
     price = str(payload.get("entry_price", payload.get("price", ""))).strip()
     sl = str(payload.get("sl", payload.get("stop_loss", ""))).strip()
     tp = str(payload.get("tp_main", payload.get("tp", payload.get("take_profit", "")))).strip()
     target = str(payload.get("target_client") if payload.get("target_client") is not None else payload.get("account_id", "")).strip().lower()
     
     # Create a unique key for the signal
-    sig_key = f"{ticker}_{side}_{signal_type}_{price}_{sl}_{tp}_{target}"
+    sig_key = f"{strategy}_{ticker}_{side}_{signal_type}_{price}_{sl}_{tp}_{target}"
     if not sig_key.replace("_", ""):
         return False
         
