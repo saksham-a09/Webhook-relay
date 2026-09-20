@@ -96,12 +96,24 @@ If you want a trade to be executed only on a specific account or EA instance, pa
   "ticker": "BTCUSD",
   "side": "LONG",
   "action": "buy",
+  "order_type": "limit",
   "quantity": 0.05,
+  "entry_price": 64500.0,
   "sl": 64000.0,
   "tp_main": 70000.0,
   "target_client": "MT5_1002938"
 }
 ```
+
+### ⚡ Order Execution Modes (`order_type`)
+
+Signals can explicitly control how MT5 executes the order via the `"order_type"` field:
+
+- `"market"`: Immediate market execution at current Bid/Ask.
+- `"pending"`: Forces pending order at `entry_price` (auto Limit or Stop based on price level).
+- `"limit"`: Places explicit Buy/Sell Limit order at `entry_price`.
+- `"stop"`: Places explicit Buy/Sell Stop order at `entry_price`.
+- *(Omitted)*: EA auto-decides — market order unless `entry_price` distance exceeds `InpPendingOrderThresholdPoints` (default 50 pts).
 
 ---
 

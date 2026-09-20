@@ -45,6 +45,7 @@ CSV_COLUMNS = [
     "ticker",
     "timeframe",
     "side",
+    "order_type",
     "trigger_close",
     "entry_price",
     "sl",
@@ -65,15 +66,31 @@ recent_signals_cache = {}
 
 
 class SignalEnvelope(BaseModel):
+    model_config = {"extra": "allow"}
+
     token: Optional[str] = Field(default=None, description="Shared secret for webhook authentication")
     signal_type: Optional[str] = None
+    order_type: Optional[str] = Field(default=None, description="Order execution type: market, pending, limit, stop, or None for auto")
     symbol: Optional[str] = None
+    ticker: Optional[str] = None
     exchange: Optional[str] = None
     timeframe: Optional[str] = None
     price: Optional[float] = None
+    entry_price: Optional[float] = None
     side: Optional[str] = None
+    action: Optional[str] = None
     strategy: Optional[str] = None
     quantity: Optional[float] = None
+    volume: Optional[float] = None
+    sl: Optional[float] = None
+    stop_loss: Optional[float] = None
+    tp_main: Optional[float] = None
+    tp: Optional[float] = None
+    take_profit: Optional[float] = None
+    tp1: Optional[float] = None
+    tp2: Optional[float] = None
+    tp3: Optional[float] = None
+    comment: Optional[str] = None
     message: Optional[str] = None
     source: Optional[str] = Field(default="pinescript")
     target_client: Optional[Any] = Field(default="all", description="Target EA client_id, account login, list/CSV, or 'all'")
@@ -112,6 +129,7 @@ def is_duplicate_signal(payload: dict[str, Any]) -> bool:
     ticker = str(payload.get("ticker", payload.get("symbol", ""))).strip().upper()
     side = str(payload.get("side", payload.get("action", ""))).strip().upper()
     signal_type = str(payload.get("type", payload.get("signal_type", ""))).strip().upper()
+    order_type = str(payload.get("order_type", "")).strip().lower()
     strategy = str(payload.get("strategy", payload.get("strategy_name", payload.get("magic_number", payload.get("magic", ""))))).strip().lower()
     price = str(payload.get("entry_price", payload.get("price", ""))).strip()
     sl = str(payload.get("sl", payload.get("stop_loss", ""))).strip()
@@ -119,7 +137,7 @@ def is_duplicate_signal(payload: dict[str, Any]) -> bool:
     target = str(payload.get("target_client") if payload.get("target_client") is not None else payload.get("account_id", "")).strip().lower()
     
     # Create a unique key for the signal
-    sig_key = f"{strategy}_{ticker}_{side}_{signal_type}_{price}_{sl}_{tp}_{target}"
+    sig_key = f"{strategy}_{ticker}_{side}_{signal_type}_{order_type}_{price}_{sl}_{tp}_{target}"
     if not sig_key.replace("_", ""):
         return False
         
@@ -150,7 +168,7 @@ def ensure_csv_file(path: Path) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         with path.open("w", newline="", encoding="utf-8") as file_handle:
-            writer = csv.DictWriter(file_handle, fieldnames=CSV_COLUMNS)
+            writer = csv.DictWriter(file_handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
             writer.writeheader()
 
 
@@ -175,15 +193,18 @@ def telegram_message(payload: dict[str, Any], mt5_result: dict[str, Any] | None 
     action = (payload.get("action") or "").lower()
     comment = payload.get("comment", "")
     ticker = payload.get("ticker", payload.get("symbol", ""))
+    order_type = str(payload.get("order_type", "")).strip().upper()
 
     is_trigger = msg_type == "TRIGGER"
-    is_entry = side == "LONG" or action == "buy"
+    is_entry = side in ("LONG", "BUY") or action in ("buy", "long")
     is_exit = side == "EXIT" or action in ["sell", "close", "close_all", "close all", "close_all_positions", "cancel_all"] or "Sl" in comment or "Tp" in comment
 
     if is_trigger:
         msg = f"[TRIGGER ALERT]\nTicker: {ticker}\nTimeframe: {payload.get('timeframe', '')}\nTrigger Close: {payload.get('trigger_close', '')}"
     elif is_entry:
-        msg = f"[LONG ENTRY]\nTicker: {ticker}\nEntry Price: {payload.get('entry_price', payload.get('price', ''))}\nSL: {payload.get('sl', '')}\nTP Main: {payload.get('tp_main', '')}"
+        type_badge = f" {order_type}" if order_type else ""
+        type_display = order_type if order_type else "AUTO/MARKET"
+        msg = f"[{side or 'LONG'}{type_badge} ENTRY]\nTicker: {ticker}\nOrder Type: {type_display}\nEntry Price: {payload.get('entry_price', payload.get('price', ''))}\nSL: {payload.get('sl', '')}\nTP Main: {payload.get('tp_main', '')}"
     elif is_exit:
         reason = comment or payload.get('reason', 'Exit signal')
         price = payload.get('price', payload.get('exit_price', ''))
@@ -247,9 +268,10 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
     action = payload.get("action", "").lower()
     comment = payload.get("comment", "")
     ticker = payload.get("ticker", payload.get("symbol", ""))
+    order_type_str = str(payload.get("order_type", "")).strip().lower()
 
     is_trigger = msg_type_upper == "TRIGGER"
-    is_entry = side == "LONG" or action == "buy"
+    is_entry = side in ("LONG", "BUY") or action in ("buy", "long")
     is_exit = side == "EXIT" or action in ["sell", "close", "close_all", "close all", "close_all_positions", "cancel_all"] or "Sl" in comment or "Tp" in comment
 
     with csv_lock:
@@ -262,7 +284,8 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
         if is_exit:
             updated = False
             for row in reversed(rows):
-                if row.get("ticker") == ticker and row.get("status") == "Open":
+                status_val = row.get("status", "")
+                if row.get("ticker") == ticker and (status_val == "Open" or status_val.startswith("Pending")):
                     row["status"] = "Closed"
                     row["exit_price"] = str(payload.get("price", payload.get("exit_price", "")))
                     row["exit_reason"] = comment or payload.get("reason", "Exit signal")
@@ -277,6 +300,7 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
                     "status": "Orphaned Exit",
                     "received_at": utc_now(),
                     "ticker": ticker,
+                    "order_type": order_type_str.upper() if order_type_str else "",
                     "exit_price": str(payload.get("price", payload.get("exit_price", ""))),
                     "exit_reason": comment or payload.get("reason", "Exit signal"),
                     "exit_time": utc_now(),
@@ -287,7 +311,16 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
                 rows.append(new_row)
         else:
             new_row = {col: "" for col in CSV_COLUMNS}
-            status = "Trigger" if is_trigger else ("Open" if is_entry else "Unknown")
+            if is_trigger:
+                status = "Trigger"
+            elif is_entry:
+                if order_type_str in ("pending", "limit", "stop"):
+                    status = f"Pending ({order_type_str.capitalize()})"
+                else:
+                    status = "Open"
+            else:
+                status = "Unknown"
+
             new_row.update({
                 "trade_id": payload.get("trade_id") or str(uuid.uuid4()),
                 "status": status,
@@ -295,6 +328,7 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
                 "ticker": ticker,
                 "timeframe": str(payload.get("timeframe", "")),
                 "side": str(payload.get("side", "")),
+                "order_type": order_type_str.upper() if order_type_str else "AUTO",
                 "trigger_close": str(payload.get("trigger_close", "")),
                 "entry_price": str(payload.get("entry_price", payload.get("price", ""))),
                 "sl": str(payload.get("sl", "")),
@@ -309,9 +343,10 @@ def append_signal_row(payload: dict[str, Any], telegram_sent: bool, telegram_err
             rows.append(new_row)
 
         with csv_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+            writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
+
 
 
 # --------------------------------------------------------------------------
